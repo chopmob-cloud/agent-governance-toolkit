@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from agt.manifest_resolution import (
+    build,
     ResolutionError,
     ResolutionReason,
     discover_policies,
@@ -1008,16 +1009,14 @@ def test_resolution_error_message_includes_reason_string() -> None:
 
 
 def _op_clause(operator: str, action: str) -> str:
-    from agt.manifest_resolution.build import _rego_field_accessor, _rego_op_clause
-
     # Both helpers are Optional-returning: the accessor is None for a field
     # path that is not a simple identifier, and the clause is None for an
     # unsupported operator. Neither applies here, so assert rather than
     # propagate None -- a silent None would surface as an opaque TypeError
     # from the `in` checks below instead of naming what failed to render.
-    accessor = _rego_field_accessor("tool_call.field")
+    accessor = build._rego_field_accessor("tool_call.field")
     assert accessor is not None, "expected an accessor for 'tool_call.field'"
-    clause = _rego_op_clause(operator, accessor, "X", action)
+    clause = build._rego_op_clause(operator, accessor, "X", action)
     assert clause is not None, f"expected a clause for operator {operator!r}"
     return clause
 
@@ -1044,9 +1043,7 @@ def test_positive_operators_keep_null_guard_regardless_of_action(operator: str) 
 def test_deny_negative_operator_missing_field_fires_deny_branch() -> None:
     # end-to-end at the render level: a deny `ne` on a pinned field renders a
     # match body that an absent field (null) satisfies, so the deny branch fires.
-    from agt.manifest_resolution.build import _render_rego
-
-    rego = _render_rego(
+    rego = build._render_rego(
         [
             {
                 "name": "pin",
@@ -1074,34 +1071,26 @@ def test_deny_negative_operator_missing_field_fires_deny_branch() -> None:
 
 
 def test_field_accessor_uses_array_path() -> None:
-    from agt.manifest_resolution.build import _rego_field_accessor
-
-    acc = _rego_field_accessor("tool_call.args.region")
+    acc = build._rego_field_accessor("tool_call.args.region")
     # single object.get over an array path, not a chain of nested object.get calls
     assert acc == 'object.get(input.snapshot, ["tool_call", "args", "region"], null)'
     assert acc.count("object.get") == 1
 
 
 def test_field_accessor_still_rejects_injection() -> None:
-    from agt.manifest_resolution.build import _rego_field_accessor
-
-    assert _rego_field_accessor("tool_call.bad-part") is None
-    assert _rego_field_accessor("a.b[0]") is None
+    assert build._rego_field_accessor("tool_call.bad-part") is None
+    assert build._rego_field_accessor("a.b[0]") is None
 
 
 def test_field_accessor_empty_field_is_snapshot_root() -> None:
-    from agt.manifest_resolution.build import _rego_field_accessor
-
-    assert _rego_field_accessor("") == "input.snapshot"
+    assert build._rego_field_accessor("") == "input.snapshot"
 
 
 def test_deny_negative_operator_missing_intermediate_still_fires() -> None:
     # end-to-end at render level: a deny `not_in` on a nested field renders a
     # match body whose accessor yields null when the PARENT is absent, so the
     # deny still fires (no chained-object.get undefined hole).
-    from agt.manifest_resolution.build import _render_rego
-
-    rego = _render_rego(
+    rego = build._render_rego(
         [
             {
                 "name": "region",
