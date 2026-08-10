@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 from agentmesh.governance.policy import PolicyEngine as _PolicyEngine
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 
@@ -142,8 +142,20 @@ def create_sidecar_app() -> FastAPI:
 
     @app.post("/api/v1/policy/reload", tags=["policy"])
     async def reload_policies() -> dict[str, Any]:
-        """Hot-reload policies from disk."""
-        _load_policies()
+        """Hot-reload policies from disk.
+
+        A strict-mode load failure keeps the previously loaded policy set (see
+        ``_load_policies``); this returns 409 rather than a bare 500 so the
+        caller can tell the reload was rejected and the prior policies serve.
+        """
+        try:
+            _load_policies()
+        except RuntimeError as exc:
+            logger.error("Policy reload rejected, keeping previous set: %s", exc)
+            raise HTTPException(
+                status_code=409,
+                detail=f"Policy reload rejected; previous policy set retained. {exc}",
+            ) from exc
         return {"status": "reloaded", "total_loaded": _loaded_count}
 
     return app

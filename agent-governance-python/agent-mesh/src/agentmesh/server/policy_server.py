@@ -96,16 +96,26 @@ def _load_policies() -> None:
             engine.load_yaml(f.read_text())
             governance_count += 1
             logger.info("Loaded governance policy: %s", f.name)
-        except Exception:
+        except Exception as gov_exc:
             # Not a governance policy; try loading it as a trust policy.
             # TrustPolicy.from_yaml takes a path, so pass the file, not its text.
             try:
                 tp = TrustPolicy.from_yaml(f)
                 trust_policies.append(tp)
                 logger.info("Loaded trust policy: %s", f.name)
-            except Exception as exc:
+            except Exception as trust_exc:
+                # Both parsers rejected the file. Report each reason so the
+                # failure is not misattributed to only the trust parser when the
+                # file was meant to be a governance policy.
                 skipped += 1
-                _on_load_failure(f.name, exc, strict)
+                _on_load_failure(
+                    f.name,
+                    RuntimeError(
+                        f"not a governance policy ({gov_exc}); "
+                        f"not a trust policy ({trust_exc})"
+                    ),
+                    strict,
+                )
 
     for f in sorted(policy_path.glob("*.json")):
         try:
@@ -222,8 +232,20 @@ async def list_policies() -> dict[str, Any]:
 
 @app.post("/api/v1/policy/reload", tags=["policy"])
 async def reload_policies() -> dict[str, Any]:
-    """Reload policies from disk."""
-    _load_policies()
+    """Reload policies from disk.
+
+    A strict-mode load failure keeps the previously loaded policy set (see
+    ``_load_policies``); this returns 409 rather than a bare 500 so the caller
+    can tell the reload was rejected and the prior policies still serve.
+    """
+    try:
+        _load_policies()
+    except RuntimeError as exc:
+        logger.error("Policy reload rejected, keeping previous set: %s", exc)
+        raise HTTPException(
+            status_code=409,
+            detail=f"Policy reload rejected; previous policy set retained. {exc}",
+        ) from exc
     return {
         "status": "reloaded",
         "total_loaded": _loaded_count,

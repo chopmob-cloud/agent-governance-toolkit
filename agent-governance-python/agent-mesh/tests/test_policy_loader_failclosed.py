@@ -129,6 +129,35 @@ class TestSidecarLoaderFailClosed:
         with pytest.raises(RuntimeError, match="bad.yaml"):
             sidecar._load_policies()
 
+    def test_strict_reload_rejected_returns_409_and_keeps_previous(
+        self, tmp_path, monkeypatch
+    ):
+        # A strict reload that hits a bad file must not 500: the endpoint returns
+        # 409 and the previously loaded policy set keeps serving.
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        good_dir = tmp_path / "good"
+        good_dir.mkdir()
+        _write(good_dir, "good.yaml", _VALID_POLICY)
+        monkeypatch.delenv("AGT_POLICY_STRICT", raising=False)
+        monkeypatch.setenv("AGT_POLICY_DIR", str(good_dir))
+        sidecar = self._sidecar()
+        app = sidecar.create_sidecar_app()
+        sidecar._load_policies()
+        assert sidecar._loaded_count == 1
+        prev_engine = sidecar._engine
+
+        bad_dir = tmp_path / "bad"
+        bad_dir.mkdir()
+        _write(bad_dir, "good.yaml", _VALID_POLICY)
+        _write(bad_dir, "bad.yaml", _BAD_POLICY)
+        monkeypatch.setenv("AGT_POLICY_DIR", str(bad_dir))
+        resp = TestClient(app).post("/api/v1/policy/reload")
+        assert resp.status_code == 409
+        assert sidecar._loaded_count == 1
+        assert sidecar._engine is prev_engine
+
 
 class TestPolicyServerLoaderFailClosed:
     @staticmethod
@@ -220,3 +249,45 @@ class TestPolicyServerLoaderFailClosed:
         data = TestClient(ps.app).get("/api/v1/policies").json()
         assert data["total_loaded"] == 1
         assert data["skipped"] == 1
+
+    def test_both_parser_errors_reported(self, tmp_path, monkeypatch):
+        # A YAML file that parses as neither governance nor trust must name both
+        # failures, not just the trust parser's, so the diagnostic is not
+        # misattributed when the file was meant to be a governance policy.
+        _write(tmp_path, "bad.yaml", _BAD_POLICY)
+        monkeypatch.delenv("AGENTMESH_POLICY_STRICT", raising=False)
+        ps = self._server()
+        monkeypatch.setattr(ps, "POLICY_DIR", str(tmp_path))
+        with pytest.raises(RuntimeError) as excinfo:
+            ps._load_policies()
+        msg = str(excinfo.value)
+        assert "governance" in msg
+        assert "trust" in msg
+
+    def test_strict_reload_rejected_returns_409_and_keeps_previous(
+        self, tmp_path, monkeypatch
+    ):
+        # A strict reload that hits a bad file must not 500: the endpoint returns
+        # 409 and the previously loaded policy set keeps serving.
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        good_dir = tmp_path / "good"
+        good_dir.mkdir()
+        _write(good_dir, "good.yaml", _VALID_POLICY)
+        monkeypatch.delenv("AGENTMESH_POLICY_STRICT", raising=False)
+        ps = self._server()
+        monkeypatch.setattr(ps, "POLICY_DIR", str(good_dir))
+        ps._load_policies()
+        assert ps._loaded_count == 1
+        prev_engine = ps._engine
+
+        bad_dir = tmp_path / "bad"
+        bad_dir.mkdir()
+        _write(bad_dir, "good.yaml", _VALID_POLICY)
+        _write(bad_dir, "bad.yaml", _BAD_POLICY)
+        monkeypatch.setattr(ps, "POLICY_DIR", str(bad_dir))
+        resp = TestClient(ps.app).post("/api/v1/policy/reload")
+        assert resp.status_code == 409
+        assert ps._loaded_count == 1
+        assert ps._engine is prev_engine
