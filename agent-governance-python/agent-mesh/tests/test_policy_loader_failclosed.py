@@ -28,6 +28,10 @@ _VALID_POLICY = (
 # governance policy nor a trust policy.
 _BAD_POLICY = "policy: [1, 2\n"
 
+# Unterminated object: json.loads raises, so load_json rejects it. The JSON
+# branch has no trust fallback, so this drives _on_load_failure directly.
+_BAD_JSON = '{"policy": [1, 2\n'
+
 
 def _write(dir_path, name, content):
     (dir_path / name).write_text(content)
@@ -106,6 +110,25 @@ class TestSidecarLoaderFailClosed:
         assert data["total_loaded"] == 1
         assert data["skipped"] == 1
 
+    def test_bad_json_strict_raises(self, tmp_path, monkeypatch):
+        _write(tmp_path, "good.yaml", _VALID_POLICY)
+        _write(tmp_path, "bad.json", _BAD_JSON)
+        monkeypatch.setenv("AGT_POLICY_DIR", str(tmp_path))
+        monkeypatch.delenv("AGT_POLICY_STRICT", raising=False)
+        sidecar = self._sidecar()
+        with pytest.raises(RuntimeError, match="bad.json"):
+            sidecar._load_policies()
+
+    def test_blank_strict_env_stays_strict(self, tmp_path, monkeypatch):
+        # A blank toggle must fail closed, not silently enable best-effort.
+        _write(tmp_path, "good.yaml", _VALID_POLICY)
+        _write(tmp_path, "bad.yaml", _BAD_POLICY)
+        monkeypatch.setenv("AGT_POLICY_DIR", str(tmp_path))
+        monkeypatch.setenv("AGT_POLICY_STRICT", "")
+        sidecar = self._sidecar()
+        with pytest.raises(RuntimeError, match="bad.yaml"):
+            sidecar._load_policies()
+
 
 class TestPolicyServerLoaderFailClosed:
     @staticmethod
@@ -164,3 +187,36 @@ class TestPolicyServerLoaderFailClosed:
         ps._load_policies()  # must not raise
         assert len(ps._trust_policies) == 1
         assert ps._loaded_count == 1
+
+    def test_bad_json_strict_raises(self, tmp_path, monkeypatch):
+        _write(tmp_path, "good.yaml", _VALID_POLICY)
+        _write(tmp_path, "bad.json", _BAD_JSON)
+        monkeypatch.delenv("AGENTMESH_POLICY_STRICT", raising=False)
+        ps = self._server()
+        monkeypatch.setattr(ps, "POLICY_DIR", str(tmp_path))
+        with pytest.raises(RuntimeError, match="bad.json"):
+            ps._load_policies()
+
+    def test_blank_strict_env_stays_strict(self, tmp_path, monkeypatch):
+        # A blank toggle must fail closed, not silently enable best-effort.
+        _write(tmp_path, "good.yaml", _VALID_POLICY)
+        _write(tmp_path, "bad.yaml", _BAD_POLICY)
+        monkeypatch.setenv("AGENTMESH_POLICY_STRICT", "")
+        ps = self._server()
+        monkeypatch.setattr(ps, "POLICY_DIR", str(tmp_path))
+        with pytest.raises(RuntimeError, match="bad.yaml"):
+            ps._load_policies()
+
+    def test_skipped_count_exposed_via_api(self, tmp_path, monkeypatch):
+        pytest.importorskip("fastapi")
+        from fastapi.testclient import TestClient
+
+        _write(tmp_path, "good.yaml", _VALID_POLICY)
+        _write(tmp_path, "bad.yaml", _BAD_POLICY)
+        monkeypatch.setenv("AGENTMESH_POLICY_STRICT", "0")
+        ps = self._server()
+        monkeypatch.setattr(ps, "POLICY_DIR", str(tmp_path))
+        ps._load_policies()
+        data = TestClient(ps.app).get("/api/v1/policies").json()
+        assert data["total_loaded"] == 1
+        assert data["skipped"] == 1

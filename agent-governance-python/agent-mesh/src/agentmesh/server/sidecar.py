@@ -182,14 +182,14 @@ def _policy_strict() -> bool:
     Defaults to on (issue #3538): a policy file that fails to load must not be
     silently dropped, or a deny policy could vanish while a broader allow keeps
     serving. Set ``AGT_POLICY_STRICT`` to ``0``/``false``/``no``/``off`` for
-    best-effort loading instead.
+    best-effort loading instead. Any other value, including blank or
+    unrecognised, stays strict so a misconfigured toggle fails closed.
     """
     return os.getenv("AGT_POLICY_STRICT", "1").strip().lower() not in {
         "0",
         "false",
         "no",
         "off",
-        "",
     }
 
 
