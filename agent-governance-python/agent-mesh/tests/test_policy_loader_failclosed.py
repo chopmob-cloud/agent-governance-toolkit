@@ -1,3 +1,4 @@
+# Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """Regression tests for issue #3538 (part 1).
 
 The sidecar (``agentmesh.server.sidecar``) and policy server
