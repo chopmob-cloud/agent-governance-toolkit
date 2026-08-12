@@ -1,3 +1,4 @@
+# Copyright (c) Microsoft Corporation. Licensed under the MIT License.
 """Regression tests for issue #3517.
 
 ``_render_rego`` emits ``default verdict := {"decision": "allow"}``. When
