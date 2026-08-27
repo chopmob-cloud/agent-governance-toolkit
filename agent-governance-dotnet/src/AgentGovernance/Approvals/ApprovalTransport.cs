@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using System.Net;
 using System.Text.Json;
 
 namespace AgentGovernance.Approvals;
@@ -64,3 +65,11 @@ public sealed record WebhookVerifiedIdentity
 public delegate WebhookVerifiedIdentity? WebhookResponseVerifier(
     JsonElement body,
     ApprovalRequest request);
+
+/// <summary>Resolves a webhook host immediately before an outbound connection.</summary>
+/// <param name="host">The webhook DNS host name.</param>
+/// <param name="cancellationToken">Cancels address resolution.</param>
+/// <returns>All addresses currently published for the host.</returns>
+public delegate Task<IPAddress[]> WebhookAddressResolver(
+    string host,
+    CancellationToken cancellationToken);

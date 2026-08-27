@@ -114,7 +114,11 @@ public sealed class ApprovalProtocolTests
     [Fact]
     public void SubmitEntry_LlmAdvisoryCannotAllowOrDeny()
     {
-        var advisory = Stage(0, "model") with { ApproverKind = ApproverKind.LlmAdvisory };
+        var advisory = Stage(0, "model") with
+        {
+            ApproverKind = ApproverKind.LlmAdvisory,
+            Required = false
+        };
         var coordinator = Coordinator(Chain(advisory, Stage(1, "alice")));
         var opened = coordinator.OpenRequest(Binding());
 
@@ -148,11 +152,22 @@ public sealed class ApprovalProtocolTests
     }
 
     [Fact]
+    public void Constructor_RejectsRequiredLlmAdvisoryStage()
+    {
+        var advisory = Stage(0, "model") with { ApproverKind = ApproverKind.LlmAdvisory };
+
+        var error = Assert.Throws<ApprovalProtocolException>(() => Coordinator(Chain(advisory)));
+
+        Assert.Contains("cannot be required", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task ResolveAsync_NoRequiredNonAdvisoryStageFailsClosed()
     {
-        var advisory = Stage(0, "model") with
+        var advisory = Stage(7, "model") with
         {
             ApproverKind = ApproverKind.LlmAdvisory,
+            Required = false,
             Transport = new DelegateTransport((_, _) => Task.FromResult(
                 Vote("model") with { ApproverKind = ApproverKind.LlmAdvisory }))
         };
@@ -163,6 +178,7 @@ public sealed class ApprovalProtocolTests
         Assert.Equal(ApprovalOutcome.Deny, result.Resolution?.Outcome);
         Assert.Equal(ApprovalReasonCodes.NoRequiredStage, result.Resolution?.ReasonCode);
         Assert.False(result.Execution?.Allowed ?? false);
+        Assert.Equal(7, Assert.Single(result.Entries).StageIndex);
     }
 
     [Theory]
@@ -256,8 +272,10 @@ public sealed class ApprovalProtocolTests
         Assert.Equal(ApprovalReasonCodes.ChainVersionMismatch, chainDecision.ReasonCode);
     }
 
-    [Fact]
-    public void ValidateForExecution_DetectsAppendedTamperEntry()
+    [Theory]
+    [InlineData(0)]
+    [InlineData(999)]
+    public void ValidateForExecution_DetectsAppendedAdvisoryAtInvalidStage(int stageIndex)
     {
         var store = new InMemoryApprovalStore();
         var binding = Binding();
@@ -268,7 +286,7 @@ public sealed class ApprovalProtocolTests
         store.AppendEntry(new ApprovalChainEntry
         {
             ApprovalRequestId = opened.Request.ApprovalRequestId,
-            StageIndex = 0,
+            StageIndex = stageIndex,
             ApproverKind = ApproverKind.LlmAdvisory,
             ApproverIdentity = "model",
             IdentityAssurance = "advisory",
@@ -412,6 +430,23 @@ public sealed class ApprovalProtocolTests
         Assert.Equal("approval_transport_error", result.Resolution?.ReasonCode);
     }
 
+    [Fact]
+    public async Task ResolveAsync_InvalidTransportVoteFailsClosed()
+    {
+        var stage = Stage(4, "alice") with
+        {
+            Transport = new DelegateTransport((_, _) => Task.FromResult(Vote("mallory")))
+        };
+        var coordinator = Coordinator(Chain(stage));
+
+        var result = await coordinator.ResolveAsync(Binding());
+
+        Assert.Equal(ApprovalOutcome.Deny, result.Resolution?.Outcome);
+        Assert.Equal("invalid_approval_vote", result.Resolution?.ReasonCode);
+        Assert.Equal(ApprovalStatus.Denied, result.Request.Status);
+        Assert.Equal(4, Assert.Single(result.Entries).StageIndex);
+    }
+
     private static ActionBinding Binding(IReadOnlyDictionary<string, object?>? parameters = null) => new()
     {
         Operation = "tool.invoke",
@@ -520,7 +555,8 @@ public sealed class WebhookApproverTests
                 Identity = "did:web:example.com:alice",
                 Assurance = "oidc",
                 Roles = new[] { "security" }
-            });
+            },
+            addressResolver: ResolvePublicEndpoint);
 
         var vote = await approver.RequestApprovalAsync(request);
 
@@ -543,7 +579,8 @@ public sealed class WebhookApproverTests
                 Identity = "did:web:example.com:alice",
                 Assurance = "oidc",
                 Roles = null!
-            });
+            },
+            addressResolver: ResolvePublicEndpoint);
 
         var vote = await approver.RequestApprovalAsync(request);
 
@@ -562,7 +599,8 @@ public sealed class WebhookApproverTests
             {
                 Identity = "did:web:example.com:alice",
                 Assurance = " "
-            });
+            },
+            addressResolver: ResolvePublicEndpoint);
 
         var error = await Assert.ThrowsAsync<ApprovalTransportProtocolException>(
             () => approver.RequestApprovalAsync(request));
@@ -575,7 +613,10 @@ public sealed class WebhookApproverTests
     {
         var request = OpenRequest();
         using var client = ClientFor(request, approved: true);
-        using var approver = new WebhookApprover(new Uri("https://approvals.example/v1"), client);
+        using var approver = new WebhookApprover(
+            new Uri("https://approvals.example/v1"),
+            client,
+            addressResolver: ResolvePublicEndpoint);
 
         var error = await Assert.ThrowsAsync<ApprovalTransportProtocolException>(
             () => approver.RequestApprovalAsync(request));
@@ -593,7 +634,10 @@ public sealed class WebhookApproverTests
             action_digest = "sha256:wrong",
             approved = true
         })));
-        using var approver = new WebhookApprover(new Uri("https://approvals.example/v1"), client);
+        using var approver = new WebhookApprover(
+            new Uri("https://approvals.example/v1"),
+            client,
+            addressResolver: ResolvePublicEndpoint);
 
         var error = await Assert.ThrowsAsync<ApprovalTransportProtocolException>(
             () => approver.RequestApprovalAsync(request));
@@ -602,61 +646,38 @@ public sealed class WebhookApproverTests
     }
 
     [Fact]
-    public async Task RequestApprovalAsync_DefaultClientDoesNotFollowRedirects()
+    public async Task RequestApprovalAsync_RevalidatesDnsAndBlocksRebinding()
     {
         var request = OpenRequest();
-        var port = GetFreePort();
-        var baseUrl = $"http://127.0.0.1:{port}";
-        using var listener = new HttpListener();
-        listener.Prefixes.Add($"{baseUrl}/");
-        listener.Start();
-        var redirectedRequests = 0;
-        var serverTask = Task.Run(async () =>
+        var sent = 0;
+        var resolutions = 0;
+        using var client = new HttpClient(new StubHandler((_, _) =>
         {
-            try
+            Interlocked.Increment(ref sent);
+            return JsonResponse(new
             {
-                while (listener.IsListening)
-                {
-                    var context = await listener.GetContextAsync().ConfigureAwait(false);
-                    if (context.Request.Url?.AbsolutePath == "/start")
-                    {
-                        context.Response.StatusCode = (int)HttpStatusCode.Found;
-                        context.Response.RedirectLocation = $"{baseUrl}/target";
-                    }
-                    else
-                    {
-                        Interlocked.Increment(ref redirectedRequests);
-                        context.Response.StatusCode = (int)HttpStatusCode.OK;
-                    }
+                approval_request_id = request.ApprovalRequestId,
+                action_digest = request.ActionDigest,
+                approved = false
+            });
+        }));
+        using var approver = new WebhookApprover(
+            new Uri("https://approvals.example/v1"),
+            client,
+            addressResolver: (_, _) => Task.FromResult(
+                Interlocked.Increment(ref resolutions) == 1
+                    ? new[] { IPAddress.Parse("93.184.216.34") }
+                    : new[] { IPAddress.Loopback }));
 
-                    context.Response.Close();
-                }
-            }
-            catch (HttpListenerException)
-            {
-                // Listener shutdown ends the test server.
-            }
-            catch (ObjectDisposedException)
-            {
-                // Listener shutdown ends the test server.
-            }
-        });
+        var firstVote = await approver.RequestApprovalAsync(request);
 
-        try
-        {
-            using var approver = new WebhookApprover(new Uri($"{baseUrl}/start"));
+        var error = await Assert.ThrowsAsync<ApprovalTransportProtocolException>(
+            () => approver.RequestApprovalAsync(request));
 
-            await Assert.ThrowsAsync<HttpRequestException>(
-                () => approver.RequestApprovalAsync(request));
-
-            Assert.Equal(0, Volatile.Read(ref redirectedRequests));
-        }
-        finally
-        {
-            listener.Stop();
-            listener.Close();
-            await serverTask.WaitAsync(TimeSpan.FromSeconds(5));
-        }
+        Assert.Equal(ApprovalEntryDecision.Deny, firstVote.Decision);
+        Assert.Equal("blocked_webhook_endpoint", error.ReasonCode);
+        Assert.Equal(2, resolutions);
+        Assert.Equal(1, sent);
     }
 
     [Fact]
@@ -664,7 +685,10 @@ public sealed class WebhookApproverTests
     {
         var request = OpenRequest();
         using var client = ClientFor(request, approved: false);
-        using var approver = new WebhookApprover(new Uri("https://approvals.example/v1"), client);
+        using var approver = new WebhookApprover(
+            new Uri("https://approvals.example/v1"),
+            client,
+            addressResolver: ResolvePublicEndpoint);
 
         var vote = await approver.RequestApprovalAsync(request);
 
@@ -673,14 +697,26 @@ public sealed class WebhookApproverTests
     }
 
     [Fact]
-    public void Constructor_BlocksMetadataEndpoints()
+    public void Constructor_BlocksLocalPrivateAndMetadataEndpoints()
     {
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://localhost/approval")));
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://127.0.0.1/approval")));
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://10.0.0.1/approval")));
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://172.16.0.1/approval")));
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://192.168.0.1/approval")));
         Assert.Throws<ArgumentException>(() => new WebhookApprover(
             new Uri("http://169.254.169.254/latest/meta-data")));
         Assert.Throws<ArgumentException>(() => new WebhookApprover(
             new Uri("http://169.254.1.2/approval")));
         Assert.Throws<ArgumentException>(() => new WebhookApprover(
             new Uri("http://[fd00:ec2::254]/latest/meta-data")));
+        Assert.Throws<ArgumentException>(() => new WebhookApprover(
+            new Uri("http://[::ffff:127.0.0.1]/approval")));
     }
 
     private static ApprovalRequest OpenRequest()
@@ -727,13 +763,12 @@ public sealed class WebhookApproverTests
         Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
     };
 
-    private static int GetFreePort()
+    private static Task<IPAddress[]> ResolvePublicEndpoint(
+        string _,
+        CancellationToken cancellationToken)
     {
-        using var listener = new System.Net.Sockets.TcpListener(IPAddress.Loopback, 0);
-        listener.Start();
-        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
-        listener.Stop();
-        return port;
+        cancellationToken.ThrowIfCancellationRequested();
+        return Task.FromResult(new[] { IPAddress.Parse("93.184.216.34") });
     }
 
     private sealed class StubHandler : HttpMessageHandler

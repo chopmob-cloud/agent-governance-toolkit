@@ -385,7 +385,19 @@ public sealed class ApprovalCoordinator
                     "approval_transport_error");
             }
 
-            result = SubmitEntry(result.Request.ApprovalRequestId, stage.StageIndex, vote);
+            try
+            {
+                result = SubmitEntry(result.Request.ApprovalRequestId, stage.StageIndex, vote);
+            }
+            catch (ApprovalProtocolException)
+            {
+                return ResolveSystemDeny(
+                    result.Request.ApprovalRequestId,
+                    stage.StageIndex,
+                    ApprovalOutcome.Deny,
+                    "invalid_approval_vote");
+            }
+
             if (result.Resolution is null)
             {
                 continue;
@@ -400,15 +412,16 @@ public sealed class ApprovalCoordinator
             return GetResult(result.Request.ApprovalRequestId) with { Execution = execution };
         }
 
+        var fallbackStageIndex = _chain.Stages.Min(stage => stage.StageIndex);
         return !requiredNonAdvisorySeen
             ? ResolveSystemDeny(
                 result.Request.ApprovalRequestId,
-                0,
+                fallbackStageIndex,
                 ApprovalOutcome.Deny,
                 ApprovalReasonCodes.NoRequiredStage)
             : ResolveSystemDeny(
                 result.Request.ApprovalRequestId,
-                0,
+                fallbackStageIndex,
                 ApprovalOutcome.Deny,
                 ApprovalReasonCodes.ChainIncomplete);
     }
@@ -659,12 +672,23 @@ public sealed class ApprovalCoordinator
                 return ApprovalReasonCodes.ChainTampered;
             }
 
-            if (entry.ApproverKind != ApproverKind.LlmAdvisory)
+            var stage = _chain.FindStage(entry.StageIndex);
+            if (stage is null)
             {
-                var stage = _chain.FindStage(entry.StageIndex);
+                return ApprovalReasonCodes.ChainTampered;
+            }
+
+            var isAdvisoryEntry = entry.ApproverKind == ApproverKind.LlmAdvisory;
+            if (isAdvisoryEntry != stage.IsAdvisory)
+            {
+                return ApprovalReasonCodes.ChainTampered;
+            }
+
+            if (!isAdvisoryEntry)
+            {
                 var isSystemDeny = entry.ApproverIdentity == "system:approval-coordinator" &&
                     entry.Decision == ApprovalEntryDecision.Deny;
-                if (stage is null || (!isSystemDeny && !stage.Authorizes(entry.ApproverIdentity, entry.Roles)))
+                if (!isSystemDeny && !stage.Authorizes(entry.ApproverIdentity, entry.Roles))
                 {
                     return ApprovalReasonCodes.ChainTampered;
                 }
@@ -811,6 +835,11 @@ public sealed class ApprovalCoordinator
         if (_chain.Stages.Select(stage => stage.StageIndex).Distinct().Count() != _chain.Stages.Count)
         {
             throw new ApprovalProtocolException("Approval stage indexes must be unique.");
+        }
+
+        if (_chain.Stages.Any(stage => stage.Required && stage.IsAdvisory))
+        {
+            throw new ApprovalProtocolException("LLM advisory stages cannot be required.");
         }
 
         if (_options.RequestTtl <= TimeSpan.Zero || _options.StageTimeout <= TimeSpan.Zero)

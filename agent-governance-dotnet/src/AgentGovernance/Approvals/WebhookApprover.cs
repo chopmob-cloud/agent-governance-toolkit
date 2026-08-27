@@ -3,6 +3,7 @@
 
 using System.Net;
 using System.Net.Http.Json;
+using System.Net.Sockets;
 using System.Text.Json;
 
 namespace AgentGovernance.Approvals;
@@ -17,6 +18,7 @@ public sealed class WebhookApprover : IApprovalTransport, IDisposable
     {
         "169.254.169.254",
         "fd00:ec2::254",
+        "metadata.google",
         "metadata.google.internal"
     };
 
@@ -25,24 +27,27 @@ public sealed class WebhookApprover : IApprovalTransport, IDisposable
     private readonly bool _ownsClient;
     private readonly IReadOnlyDictionary<string, string> _headers;
     private readonly WebhookResponseVerifier? _responseVerifier;
+    private readonly WebhookAddressResolver _addressResolver;
 
     /// <summary>Creates a versioned webhook approval transport.</summary>
     /// <param name="endpoint">The HTTP or HTTPS approval endpoint.</param>
     /// <param name="httpClient">An optional caller-owned HTTP client.</param>
     /// <param name="headers">Optional authentication or routing headers.</param>
     /// <param name="responseVerifier">Verifies the principal behind approve responses.</param>
+    /// <param name="addressResolver">
+    /// Optional DNS resolver for service discovery or testing. Every returned address is still validated.
+    /// </param>
     public WebhookApprover(
         Uri endpoint,
         HttpClient? httpClient = null,
         IReadOnlyDictionary<string, string>? headers = null,
-        WebhookResponseVerifier? responseVerifier = null)
+        WebhookResponseVerifier? responseVerifier = null,
+        WebhookAddressResolver? addressResolver = null)
     {
         ValidateEndpoint(endpoint);
         _endpoint = endpoint;
-        _httpClient = httpClient ?? new HttpClient(new HttpClientHandler
-        {
-            AllowAutoRedirect = false
-        });
+        _addressResolver = addressResolver ?? Dns.GetHostAddressesAsync;
+        _httpClient = httpClient ?? CreateHttpClient(_addressResolver);
         _ownsClient = httpClient is null;
         _headers = headers is null
             ? new Dictionary<string, string>(StringComparer.Ordinal)
@@ -75,6 +80,14 @@ public sealed class WebhookApprover : IApprovalTransport, IDisposable
         CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(request);
+
+        if (!_ownsClient)
+        {
+            _ = await ResolveAllowedAddressesAsync(
+                _endpoint.DnsSafeHost,
+                _addressResolver,
+                cancellationToken).ConfigureAwait(false);
+        }
 
         using var message = new HttpRequestMessage(HttpMethod.Post, _endpoint)
         {
@@ -184,27 +197,151 @@ public sealed class WebhookApprover : IApprovalTransport, IDisposable
             throw new ArgumentException("Approval webhook endpoint must use HTTP or HTTPS.", nameof(endpoint));
         }
 
-        var normalizedHost = endpoint.Host.Trim('[', ']');
-        if (BlockedHosts.Contains(normalizedHost))
+        var normalizedHost = endpoint.IdnHost.Trim('[', ']').TrimEnd('.');
+        if (IsBlockedHostName(normalizedHost))
         {
             throw new ArgumentException("Approval webhook endpoint host is blocked.", nameof(endpoint));
         }
 
-        if (IPAddress.TryParse(normalizedHost, out var address) && IsLinkLocal(address))
+        if (IPAddress.TryParse(normalizedHost, out var address) && IsBlockedAddress(address))
         {
             throw new ArgumentException("Approval webhook endpoint host is blocked.", nameof(endpoint));
         }
     }
 
-    private static bool IsLinkLocal(IPAddress address)
+    private static HttpClient CreateHttpClient(WebhookAddressResolver addressResolver)
     {
-        if (address.IsIPv6LinkLocal)
+        var handler = new SocketsHttpHandler
         {
-            return true;
+            AllowAutoRedirect = false,
+            UseProxy = false,
+            ConnectCallback = async (context, cancellationToken) =>
+            {
+                var addresses = await ResolveAllowedAddressesAsync(
+                    context.DnsEndPoint.Host,
+                    addressResolver,
+                    cancellationToken).ConfigureAwait(false);
+                Exception? lastException = null;
+                foreach (var address in addresses)
+                {
+                    var socket = new Socket(address.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
+                    try
+                    {
+                        await socket.ConnectAsync(
+                            new IPEndPoint(address, context.DnsEndPoint.Port),
+                            cancellationToken).ConfigureAwait(false);
+                        return new NetworkStream(socket, ownsSocket: true);
+                    }
+                    catch (SocketException exception)
+                    {
+                        socket.Dispose();
+                        lastException = exception;
+                    }
+                    catch
+                    {
+                        socket.Dispose();
+                        throw;
+                    }
+                }
+
+                throw new HttpRequestException("No resolved webhook address accepted the connection.", lastException);
+            }
+        };
+        return new HttpClient(handler);
+    }
+
+    private static async Task<IPAddress[]> ResolveAllowedAddressesAsync(
+        string host,
+        WebhookAddressResolver addressResolver,
+        CancellationToken cancellationToken)
+    {
+        if (IPAddress.TryParse(host.Trim('[', ']'), out var literalAddress))
+        {
+            return IsBlockedAddress(literalAddress)
+                ? throw new ApprovalTransportProtocolException("blocked_webhook_endpoint")
+                : new[] { NormalizeAddress(literalAddress) };
         }
 
-        var bytes = address.GetAddressBytes();
-        return bytes.Length == 4 && bytes[0] == 169 && bytes[1] == 254;
+        IPAddress[] addresses;
+        try
+        {
+            addresses = await addressResolver(host, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            throw new ApprovalTransportProtocolException("webhook_endpoint_resolution_failed");
+        }
+
+        if (addresses is null || addresses.Length == 0)
+        {
+            throw new ApprovalTransportProtocolException("webhook_endpoint_resolution_failed");
+        }
+
+        if (addresses.Any(IsBlockedAddress))
+        {
+            throw new ApprovalTransportProtocolException("blocked_webhook_endpoint");
+        }
+
+        return addresses.Select(NormalizeAddress).Distinct().ToArray();
+    }
+
+    private static bool IsBlockedHostName(string host) =>
+        string.Equals(host, "localhost", StringComparison.OrdinalIgnoreCase) ||
+        host.EndsWith(".localhost", StringComparison.OrdinalIgnoreCase) ||
+        BlockedHosts.Any(blocked =>
+            string.Equals(host, blocked, StringComparison.OrdinalIgnoreCase) ||
+            host.EndsWith($".{blocked}", StringComparison.OrdinalIgnoreCase));
+
+    private static bool IsBlockedAddress(IPAddress address)
+    {
+        address = NormalizeAddress(address);
+        if (address.AddressFamily == AddressFamily.InterNetwork)
+        {
+            var bytes = address.GetAddressBytes();
+            return bytes[0] is 0 or 10 or 127 ||
+                (bytes[0] == 100 && bytes[1] is >= 64 and <= 127) ||
+                (bytes[0] == 169 && bytes[1] == 254) ||
+                (bytes[0] == 172 && bytes[1] is >= 16 and <= 31) ||
+                (bytes[0] == 192 && bytes[1] is 0 or 2 or 168) ||
+                (bytes[0] == 192 && bytes[1] == 88 && bytes[2] == 99) ||
+                (bytes[0] == 198 && bytes[1] is 18 or 19) ||
+                (bytes[0] == 198 && bytes[1] == 51 && bytes[2] == 100) ||
+                (bytes[0] == 203 && bytes[1] == 0 && bytes[2] == 113) ||
+                bytes[0] >= 224;
+        }
+
+        var ipv6 = address.GetAddressBytes();
+        return IPAddress.IsLoopback(address) ||
+            address.Equals(IPAddress.IPv6Any) ||
+            address.IsIPv6LinkLocal ||
+            address.IsIPv6SiteLocal ||
+            address.IsIPv6Multicast ||
+            (ipv6[0] & 0xfe) == 0xfc ||
+            (ipv6[0] == 0x20 && ipv6[1] == 0x01 && ipv6[2] == 0x0d && ipv6[3] == 0xb8);
+    }
+
+    private static IPAddress NormalizeAddress(IPAddress address)
+    {
+        if (address.IsIPv4MappedToIPv6)
+        {
+            return address.MapToIPv4();
+        }
+
+        if (address.AddressFamily == AddressFamily.InterNetworkV6)
+        {
+            var bytes = address.GetAddressBytes();
+            if (bytes.Take(12).All(value => value == 0) &&
+                (bytes[12] != 0 || bytes[13] != 0 || bytes[14] != 0 || bytes[15] > 1))
+            {
+                return new IPAddress(bytes[^4..]);
+            }
+        }
+
+        return address;
     }
 
     private static bool Matches(JsonElement body, string propertyName, string expected) =>

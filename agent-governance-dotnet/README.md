@@ -222,7 +222,7 @@ In this example, accumulation raises the envelope to `Restricted`, adds `no_exte
 
 ### Action-Bound Approval Chains
 
-`require_approval` decisions can be routed through the ADR-0030 approval protocol. The protocol binds approval to the exact agent, subject, operation, target, parameters, policy version, and chain version. It persists pending requests, records hash-linked entries, fails closed on timeout or malformed responses, and revalidates and consumes a terminal allow immediately before execution.
+`require_approval` decisions can be routed through the ADR-0030 approval protocol. The protocol binds approval to the exact agent, subject, operation, target, parameters, policy version, and chain version. It persists pending requests, records hash-linked entries, fails closed on timeout or malformed responses, and revalidates and consumes a terminal allow immediately before execution. The entry chain uses plain SHA-256 without a secret key for tamper evidence inside a trusted store boundary. It is not a MAC or signature, so a writer with direct store access can recompute the chain.
 
 ```csharp
 using AgentGovernance.Approvals;
@@ -296,7 +296,7 @@ if (!execution.Allowed)
 }
 ```
 
-For remote workflows, attach a `WebhookApprover` to an `ApprovalStage`. Its versioned payload carries the request and action digests, policy and chain versions, and expiry. Approve responses are accepted only when a supplied `WebhookResponseVerifier` returns an identity established through authenticated transport or a verified assertion. LLM entries are advisory and cannot authorize or deny execution. A chain with no required non-advisory stage fails closed with `no_required_approval_stage`; this intentionally avoids the vacuous-allow behavior in the current Python implementation and matches the safer Go parity behavior.
+For remote workflows, attach a `WebhookApprover` to an `ApprovalStage`. Its versioned payload carries the request and action digests, policy and chain versions, and expiry. Approve responses are accepted only when a supplied `WebhookResponseVerifier` returns an identity established through authenticated transport or a verified assertion. The default HTTP client rejects redirects and pins each connection to request-time DNS results after rejecting loopback, link-local, private, and reserved addresses. A caller-supplied `HttpClient` receives the same request-time address check, but its handler remains responsible for pinning the validated destination when it connects. LLM entries are optional advisory stages and cannot authorize or deny execution. A chain with no required non-advisory stage fails closed with `no_required_approval_stage`; this intentionally avoids the vacuous-allow behavior in the current Python implementation and matches the safer Go parity behavior. `ResolveAsync` consumes an allowed approval before returning, so callers should use its `Execution` result rather than validating the same request again.
 
 ### Rate Limiting
 

@@ -351,7 +351,10 @@ public sealed record ApprovalChainEntry
     /// <summary>The UTC decision time.</summary>
     public DateTimeOffset DecidedAt { get; init; } = DateTimeOffset.UtcNow;
 
-    /// <summary>Returns a copy with its tamper-evident digest populated.</summary>
+    /// <summary>
+    /// Returns a copy with its tamper-evident SHA-256 digest populated without a secret key.
+    /// This detects changes outside the trusted store boundary but does not authenticate a store writer.
+    /// </summary>
     public ApprovalChainEntry Seal() => this with { EntryDigest = ComputeDigest() };
 
     /// <summary>Returns whether the stored entry digest matches the entry contents.</summary>
