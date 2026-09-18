@@ -460,14 +460,18 @@ def _rego_op_clause(operator: str, accessor: str, value: Any, action: str = "all
             f"{indent}endswith(_v, {literal})"
         )
     if operator in {"matches", "regex"}:
-        # Validate the pattern at build time via the repo's authoritative RE2
-        # checker. A non-string or uncompilable pattern would make regex.match
-        # raise at eval time, leaving a silently dead deny (fail open). Return
-        # None instead so the caller emits a fail-closed always-matching deny.
+        # Validate the pattern at build time with require_opa=True, so an
+        # authoritative Go RE2 engine (OPA on PATH or the google-re2 binding)
+        # must be present. Without require_opa the check would silently fall
+        # to the non-authoritative Python tier, which can accept a pattern Go
+        # RE2 rejects; that pattern then makes regex.match raise at eval time,
+        # leaving a silently dead deny (fail open). A rejected or non-string
+        # pattern returns None so the caller emits a fail-closed always-
+        # matching deny instead.
         if not isinstance(value, str):
             return None
         try:
-            validate_re2(value)
+            validate_re2(value, require_opa=True)
         except Exception:
             return None
         return (
