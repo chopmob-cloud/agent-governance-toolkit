@@ -251,11 +251,19 @@ def _render_rego(rules: list[dict[str, Any]]) -> str:
             # never silently falls through to default-allow. The merge
             # layer should ideally catch this at validation, but this is
             # the last line of defense.
-            invalid_detail = (
-                f"invalid field {field!r}"
-                if accessor is None
-                else f"unsupported operator {operator!r}"
-            )
+            if accessor is None:
+                invalid_detail = f"invalid field {field!r}"
+            elif operator in {"matches", "regex"}:
+                # The operator is supported; the clause was dropped because
+                # the pattern was rejected or no authoritative RE2 validator
+                # was present (validate_re2(require_opa=True)).
+                invalid_detail = (
+                    f"regex pattern for operator {operator!r} was rejected "
+                    f"or no authoritative RE2 validator was available "
+                    f"(install OPA or google-re2)"
+                )
+            else:
+                invalid_detail = f"unsupported operator {operator!r}"
             unsupported_drops.append(name)
             matchers.append(
                 f"_match_{idx} if {{\n"

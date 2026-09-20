@@ -505,7 +505,7 @@ def test_merge_deny_eq_null_child_allow_not_in_preserved() -> None:
 def test_merge_deny_and_eqnull_ne_sibling_eqnull_first_drops_child_allow() -> None:
     """Deny ``and[eq null, ne X]`` fires on an absent field; overlap must drop child.
 
-    Regression for the polarity-by-position bug (liamcrumm review of #3529):
+    Regression for the polarity-by-position bug (fail-closed review of #3529):
     ``_condition_unsatisfiable`` compares the two ``and`` siblings as a peer
     pair, not a deny/allow overlap. With this sibling order the pre-fix code
     applied allow (guarded) semantics to the deny ``ne`` and wrongly declared

@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
-"""OPA-backed regressions for @liamcrumm's review of PR #3529.
+"""OPA-backed fail-closed regressions for PR #3529.
 
 Two fail-open flips found on OPA 0.70.0 and fixed in
 ``_migrate_resolution/build.py``:
