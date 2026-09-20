@@ -5,6 +5,80 @@ entries appear first.
 
 ---
 
+## Python manifests declaring annotators require an explicit dispatcher
+
+**Date:** TBD
+
+**Affected**
+
+- Python hosts loading manifests with a non-empty `annotators` section using
+  the default wheel or a source build without `bundled-dispatchers`
+
+**What changed**
+
+After the ACS retarget, the credential-reading bundled annotator dispatcher
+is opt-in. Without it, constructing `AgentControl` with a manifest that
+declares annotators fails unless the host supplies `annotator_dispatcher`.
+This applies even if those annotators are not used by an interception point.
+Manifests without annotators still construct without an annotator dispatcher,
+and the default OPA policy dispatcher remains available.
+
+**How to update**
+
+Pass a host dispatcher with a `dispatch(annotator_name, annotator_config,
+preliminary_policy_input)` method, for example
+`AgentControl.from_path("manifest.yaml", annotator_dispatcher=host_annotator)`.
+Alternatively, build the Python extension with the `bundled-dispatchers`
+Cargo feature to opt into the bundled dispatcher and its access to host
+environment credentials. This is a build-time feature, not a Python package extra.
+
+See [the Python SDK dispatcher guidance](policy-engine/sdk/python/README.md#annotator-dispatchers).
+
+---
+
+## `Policy.scope` is validated at construction, invalid scopes are rejected
+
+**Date:** TBD
+
+**Affected**
+
+- Any `Policy` YAML/JSON file or programmatic construction that uses a
+  `scope` value other than `global`, `tenant`, `organization`, or `agent`
+  (case-sensitive)
+- Python: `Policy(scope="organisation")` now raises `ValueError`
+- TypeScript: `engine.loadYaml(...)` / `engine.loadJson(...)` now throws
+  `Error` for invalid scope
+- .NET: `Policy.FromYaml(...)` / `Policy.FromJson(...)` now throws
+  `ArgumentException` for invalid scope
+
+**What changed**
+
+Previously, an unrecognised `scope` value (British spelling, wrong case,
+invented value, empty string) was silently demoted to `GLOBAL` at evaluation
+time.  Under the `most_specific_wins` conflict strategy this demotion could
+flip a deny into an allow, the wrong failure direction for a governance
+component.
+
+The fix validates `scope` at the earliest possible point: model construction
+(Python), `dataToPolicy` (TypeScript), and `FromDocument` (.NET).  The set
+of accepted values is derived from the `PolicyScope` enum so the validator
+and the enum cannot drift apart.
+
+**Migration**
+
+Fix the typo.  If you used `"organisation"`, change it to `"organization"`.
+If you relied on the silent demotion to `GLOBAL`, set the scope explicitly to
+`"global"`.
+
+**Additional TypeScript change:** The `PolicyScope` enum now includes
+`Organization = 'organization'`.  The `SCOPE_SPECIFICITY` map adds
+`Organization: 2` and bumps `Agent` from `2` to `3` to match the Python and
+.NET SDKs.  The numeric specificity values are an internal implementation
+detail, the string-based `resolutionTrace` is the stable contract, but if
+you logged or stored numeric specificity values, they will change.
+
+---
+
 ## Manifests declaring `bundle_url`, `system_prompt_file` or `system_prompt_url` are rejected
 
 **Date:** TBD
@@ -264,6 +338,46 @@ re-derives the measurement from the same audit entries now computes a different
 value, so those records must be re-issued (rebuilt and re-signed), not merely
 re-exported. `AuditService.summary()` likewise reports the new `root_hash` for
 the affected sizes.
+
+---
+
+## Hypervisor session lifecycle methods are synchronous
+
+**Date:** TBD
+
+**Affected**
+
+- `agent-hypervisor` (`hypervisor.Hypervisor`)
+- callers of `create_session`, `join_session`, `activate_session`,
+  `terminate_session`, `verify_behavior`, and `monitor_sessions`
+
+**What changed**
+
+The following `Hypervisor` methods are now synchronous:
+
+- `create_session`
+- `join_session`
+- `activate_session`
+- `terminate_session`
+- `verify_behavior`
+- `monitor_sessions`
+
+They previously returned coroutines despite having no internal await points.
+They now return their result directly.
+
+**How to migrate**
+
+Remove `await` when calling these methods:
+
+```python
+session = hv.create_session(config=config, creator_did="did:mesh:admin")
+ring = hv.join_session(session.sso.session_id, "did:mesh:agent", sigma_raw=0.85)
+hv.activate_session(session.sso.session_id)
+hash_root = hv.terminate_session(session.sso.session_id)
+```
+
+Keep awaiting unrelated async APIs such as `SagaOrchestrator.execute_step` and
+`SagaOrchestrator.compensate`.
 
 ---
 

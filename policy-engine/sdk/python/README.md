@@ -6,7 +6,23 @@ Agent Control Specification (ACS) is a stateless, deterministic, fail-closed pol
 
 This package is the thin Python surface for the stateless Agent Control Specification runtime.
 
-It intentionally owns Python async orchestration and host/framework integration while the native core owns deterministic intervention point evaluation. `AgentControl.from_path("manifest.yaml")` builds a control backed by the bundled Rust core through the `_native` extension. The release pipeline produces CPython 3.11+ ABI3 wheels for Linux x86_64 and ARM64 with glibc 2.28 or newer, macOS Intel and Apple Silicon, and Windows x86_64. Installing one of those wheels does not require Rust. On other platforms pip falls back to the source distribution and builds the extension locally with maturin and Rust. With no dispatcher arguments the bundled OPA policy dispatcher and annotator dispatcher are wired automatically, so a host that uses Rego policies integrates in roughly three lines. Pass `annotator_dispatcher=` and `policy_dispatcher=` (or use `from_native(manifest, ...)`) to override either bundled default with host-specific logic. The zero-config construction section in the root README describes when to supply custom dispatchers.
+It intentionally owns Python async orchestration and host/framework integration while the native core owns deterministic intervention point evaluation. `AgentControl.from_path("manifest.yaml")` builds a control backed by the bundled Rust core through the `_native` extension. The release pipeline produces CPython 3.11+ ABI3 wheels for Linux x86_64 and ARM64 with glibc 2.28 or newer, macOS Intel and Apple Silicon, and Windows x86_64. Installing one of those wheels does not require Rust. On other platforms pip falls back to the source distribution and builds the extension locally with maturin and Rust. The default OPA policy dispatcher is wired automatically. Pass `policy_dispatcher=` to use host-specific policy logic. Manifests declaring annotators also require a host `annotator_dispatcher=` unless the extension was built with `bundled-dispatchers`.
+
+## Annotator dispatchers
+
+The default wheel does not enable the `bundled-dispatchers` Cargo feature.
+A manifest with a non-empty `annotators` section therefore requires an explicit
+`annotator_dispatcher`, including when its annotators are not referenced by an
+interception point. Supply a host object implementing
+`dispatch(annotator_name, annotator_config, preliminary_policy_input)` through
+`AgentControl.from_path("manifest.yaml", annotator_dispatcher=host_annotator)`
+or the corresponding argument on the other native constructors. Construction
+fails if a required dispatcher is missing.
+
+To opt into the bundled annotator dispatcher, build the extension from source
+with the `bundled-dispatchers` Cargo feature. This enables dispatchers that read
+host environment credentials. It is a build-time option, not a pip extra.
+Manifests without annotators do not need an annotator dispatcher.
 
 Runnable pieces today:
 
@@ -28,7 +44,7 @@ Runnable pieces today:
 
 Adapters are intentionally stateless. Pass ambient per-call data with the reserved keyword `agent_control_snapshot={...}`; it is merged over any default snapshot supplied when creating the wrapper. Unsupported or potentially bypassing methods raise `AdapterUnsupportedError` rather than returning an unguarded path. `guard_mcp_server()` covers MCP tool calls only. MCP resources, prompts, streams, and lifecycle hooks still need package-specific adapters, and known unsupported methods on a wrapped provider are blocked instead of being delegated. `guard_litellm_proxy()` buffers JSON ASGI request/response bodies and streaming chat responses instead of bypassing controls. `AgentControlLiteLLMGuardrail` maps LiteLLM `pre_call` and `post_call` guardrail hooks to ACS input, model, tool, and output intervention points. Install the optional proxy dependency with `pip install "agent-control-specification[litellm-proxy]"`.
 
-Use `parse_manifest(text)` when a host needs the runtime parser's YAML or JSON value before applying another contract such as JSON Schema. Use `validate_manifest(text)` for a complete manifest and `validate_manifest_overlay(text)` for resolution-independent checks on a partial manifest with `extends`. All three functions use the same bounded `serde_yaml` implementation as runtime construction.
+Use `parse_manifest(text)` when a host needs a YAML or JSON value before applying another contract such as JSON Schema. Use `validate_manifest(text)` for a complete manifest and `validate_manifest_overlay(text)` for resolution-independent checks on a partial manifest with `extends`. These tooling functions use AGT's bounded `serde-saphyr` parser. Runtime construction delegates to the pinned upstream ACS engine, whose parser migration must be released before AGT's registry dependency can be updated.
 
 ```python
 from agent_control_specification import validate_acs_artifacts
