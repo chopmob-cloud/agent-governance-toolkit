@@ -37,6 +37,14 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check example manifest intervention-point coverage
+        # Fail closed when a shipped rego example omits an adapter-evaluated
+        # intervention point (e.g. pre_tool_call); the engine denies unbound
+        # points, breaking the manifest on the first matching interception.
+        run: |
+          pip install --no-cache-dir pyyaml
+          python scripts/check_example_intervention_points.py
+
       - name: Build native ACS SDK
         # agent-compliance's manifest linter calls the native
         # `agent_control_specification` Rust SDK (pyo3/maturin); build it from
