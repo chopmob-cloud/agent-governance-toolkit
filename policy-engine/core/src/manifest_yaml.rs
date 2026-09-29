@@ -1092,7 +1092,9 @@ mod tests {
         let bundle = parse(&rego_manifest("    bundle: ./policy\n"));
         let error = reject_url_manifest_local_fields(&bundle).unwrap_err();
         assert!(
-            error.detail().starts_with("policy 'p' declares the local filesystem field 'bundle'"),
+            error
+                .detail()
+                .starts_with("policy 'p' declares the local filesystem field 'bundle'"),
             "{}",
             error.detail()
         );
@@ -1113,6 +1115,48 @@ mod tests {
             .unwrap_err()
             .detail()
             .contains("'policy_path'"));
+
+        // rego `data` document, also flattened into adapter_config.
+        let rego_data = parse(&rego_manifest("    data: ./data.json\n"));
+        assert!(reject_url_manifest_local_fields(&rego_data)
+            .unwrap_err()
+            .detail()
+            .contains("'data'"));
+
+        // cedar `entities_path` and `schema_path`.
+        for (field, line) in [
+            ("entities_path", "    entities_path: ./e.json\n"),
+            ("schema_path", "    schema_path: ./s.json\n"),
+        ] {
+            let cedar = format!(
+                "{VERSION}policies:\n  p:\n    type: cedar\n{line}\
+                 intervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n"
+            );
+            assert!(reject_url_manifest_local_fields(&parse(&cedar))
+                .unwrap_err()
+                .detail()
+                .contains(field));
+        }
+
+        // a custom policy carrying a data document.
+        let custom = format!(
+            "{VERSION}policies:\n  p:\n    type: custom\n    adapter: mine\n    data_paths:\n      - ./d.json\n\
+             intervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n"
+        );
+        assert!(reject_url_manifest_local_fields(&parse(&custom))
+            .unwrap_err()
+            .detail()
+            .contains("'data_paths'"));
+
+        // a data document declared on an intervention-point policy binding.
+        let binding = format!(
+            "{VERSION}policies:\n  p:\n    type: rego\n    query: data.acs.result\n\
+             intervention_points:\n  input:\n    policy_target: $snap.input\n    policy:\n      id: p\n      data:\n        x: ./d.json\n"
+        );
+        assert!(reject_url_manifest_local_fields(&parse(&binding))
+            .unwrap_err()
+            .detail()
+            .contains("'data'"));
 
         // A manifest that supplies policy inline is accepted.
         let inline = parse(&rego_manifest(""));
