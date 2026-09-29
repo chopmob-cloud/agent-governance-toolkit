@@ -1303,3 +1303,6 @@ xmrn
 
 # International Traffic in Arms Regulations
 ITAR
+bssn
+uncued
+undelimited
