@@ -8,14 +8,20 @@ Usage:
 The engine denies an intervention point that an adapter evaluates but the
 manifest does not bind (``runtime_error:intervention_point_unknown``), so an
 agent loading such a manifest fails on its first tool call. Sixteen of the
-nineteen in-repo adapters evaluate ``pre_tool_call``, and every adapter
-evaluates ``input`` and ``output``; a shipped example that omits one of these
-points is therefore broken for those adapters (issue #3540).
+nineteen in-repo adapters evaluate ``pre_tool_call`` and twelve evaluate
+``output`` (every adapter evaluates ``input``). Requiring ``output`` as well as
+``input`` and ``pre_tool_call`` is deliberately stricter than the bare minimum:
+a shipped example that omits a point is broken for the adapters that evaluate it,
+and the extra points deny-by-default rather than fail, so requiring them is the
+safe direction (issue #3540).
 
 Scope: manifests under ``examples/policies/`` and ``examples/policy-templates/``
 that declare ``intervention_points`` and use at least one ``type: rego`` policy.
 Manifests with no intervention points (non-agent-control configs) and
 custom-adapter manifests (which define their own point semantics) are exempt.
+Framework example manifests elsewhere in the tree (for example ``deerflow`` and
+``maf-integration``) are out of scope here; they need per-adapter decisions about
+``output`` and are checked separately.
 """
 from __future__ import annotations
 
