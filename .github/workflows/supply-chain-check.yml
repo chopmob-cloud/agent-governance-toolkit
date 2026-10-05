@@ -306,6 +306,9 @@ jobs:
   # `check sources` so the gate stays deterministic and does not flake
   # on time-varying advisory data; advisories, licenses and bans are
   # intentionally left out of CI for now.
+  # Covers both Rust workspaces (policy-engine, agent-governance-rust) and
+  # the two standalone manifests (policy-engine/examples/coding_agent/app and
+  # the prompt-injection benchmark harness), which reuse policy-engine/deny.toml.
   # ------------------------------------------------------------------
   cargo-source-policy:
     name: Cargo source policy (cargo-deny)
@@ -325,7 +328,7 @@ jobs:
           set -euo pipefail
           archive="$RUNNER_TEMP/cargo-deny.tar.gz"
           dir="cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl"
-          curl -fsSL -o "$archive"             "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${dir}.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/${dir}.tar.gz"
           echo "${CARGO_DENY_SHA256}  ${archive}" | sha256sum -c -
           tar -xzf "$archive" -C "$RUNNER_TEMP"
           install -m755 "$RUNNER_TEMP/${dir}/cargo-deny" "$RUNNER_TEMP/cargo-deny"
@@ -334,3 +337,8 @@ jobs:
         run: cargo-deny --manifest-path policy-engine/Cargo.toml --all-features check sources
       - name: cargo deny check sources (agent-governance-rust)
         run: cargo-deny --manifest-path agent-governance-rust/Cargo.toml --all-features check sources
+      # Standalone manifests outside the two workspaces reuse policy-engine/deny.toml.
+      - name: cargo deny check sources (coding_agent example)
+        run: cargo-deny --manifest-path policy-engine/examples/coding_agent/app/Cargo.toml --config policy-engine/deny.toml --all-features check sources
+      - name: cargo deny check sources (prompt-injection benchmark harness)
+        run: cargo-deny --manifest-path benchmarks/prompt-injection/harness/agt-rules-baseline/Cargo.toml --config policy-engine/deny.toml --all-features check sources
