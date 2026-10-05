@@ -23,6 +23,8 @@ on:
       - '**/go.mod'
       - '**/go.sum'
       - '**/build.rs'
+      # Cargo source policy for the Rust workspaces.
+      - '**/deny.toml'
       # If the scanner code itself changes, the trip-wire job must run.
       - 'scripts/check_release_age.py'
       - 'scripts/check_install_scripts.py'
@@ -294,3 +296,35 @@ jobs:
             --min-score 5.0 \
             --max-deps 50 \
             "${extra_args[@]}"
+
+  # ------------------------------------------------------------------
+  # Cargo source policy: enforce the [sources] allow-list (deny unknown
+  # git and non-crates.io registries) via cargo-deny. The 7-day
+  # release-age check skips path and git crates because they carry no
+  # registry publish date, so without this a git dependency can reach
+  # the tree with no automated Cargo source gate. Scoped to
+  # `check sources` so the gate stays deterministic and does not flake
+  # on time-varying advisory data; advisories, licenses and bans are
+  # intentionally left out of CI for now.
+  # ------------------------------------------------------------------
+  cargo-source-policy:
+    name: Cargo source policy (cargo-deny)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: scanner-trip-wire
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: cargo deny check sources (policy-engine)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: policy-engine/Cargo.toml
+          command: check
+          command-arguments: sources
+      - name: cargo deny check sources (agent-governance-rust)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: agent-governance-rust/Cargo.toml
+          command: check
+          command-arguments: sources
