@@ -10,8 +10,20 @@ instead of many hand edited files.
 
 Usage::
 
-    python3 scripts/ci/generate_workflows.py --write   # regenerate YAML
-    python3 scripts/ci/generate_workflows.py --check   # fail on drift
+    python3 scripts/ci/generate_workflows.py --write          # regenerate YAML
+    python3 scripts/ci/generate_workflows.py --check          # fail on drift
+    python3 scripts/ci/generate_workflows.py --sync-registry  # adopt bumped pins
+
+``--sync-registry`` runs generation in reverse. Dependabot can edit a pinned
+action in the generated workflow (which lives under ``.github/workflows``) but
+cannot edit ``.github/ci/actions.toml`` (its source of truth), so such a bump
+leaves the generated file drifting from the registry and ``--check`` fails. This
+mode reads the bumped pin back out of the managed files, updates the registry to
+match, and then regenerates exactly as ``--write`` does, which also rewrites the
+generated workflow YAML and synchronizes the composite action pins under
+``.github/actions`` to the registry. It is the deterministic equivalent of the
+manual registry sync a maintainer would otherwise push on every actions bump.
+Every path it reads or writes is validated to stay within the repository.
 
 The renderer is intentionally deterministic and dependency free. It emits a
 ``DO NOT EDIT`` banner, enforces full SHA pinned actions resolved from the
@@ -114,12 +126,33 @@ def _composite_action_files() -> list[Path]:
         raise GenerationError(
             f"missing composite actions directory: {COMPOSITE_ACTIONS_DIR}"
         )
+    if COMPOSITE_ACTIONS_DIR.is_symlink():
+        raise GenerationError(
+            f"refusing to follow a symlinked composite actions directory: "
+            f"{_display_path(COMPOSITE_ACTIONS_DIR)}"
+        )
+    boundary = COMPOSITE_ACTIONS_DIR.resolve()
     paths = {
         path
         for pattern in ("*/action.yml", "*/action.yaml")
         for path in COMPOSITE_ACTIONS_DIR.glob(pattern)
     }
-    return sorted(paths)
+    result: list[Path] = []
+    for path in sorted(paths):
+        # Containment: refuse any symlinked action file, and any path that
+        # resolves outside the composite actions directory, so neither the pin
+        # reader nor the writer can be made to follow a link out of the tree.
+        if path.is_symlink():
+            raise GenerationError(
+                f"refusing to follow a symlinked composite action file: {path}"
+            )
+        if not path.resolve().is_relative_to(boundary):
+            raise GenerationError(
+                f"composite action path escapes "
+                f"{_display_path(COMPOSITE_ACTIONS_DIR)}: {path}"
+            )
+        result.append(path)
+    return result
 
 
 def _display_path(path: Path) -> str:
@@ -217,6 +250,161 @@ def sync_composite_action_pins(actions: dict[str, str]) -> list[Path]:
             ) from exc
         changed.append(path)
     return changed
+
+
+_PIN_LINE_RE = re.compile(
+    r"uses:\s*(?P<ref>[A-Za-z0-9._/-]+@[0-9a-f]{40})(?:\s*#\s*(?P<comment>.+?))?\s*$"
+)
+_SECTION_RE = re.compile(r"^\[(?P<key>[^\]]+)\]\s*$")
+# Version comments adopted into the registry are written as a TOML string, so
+# constrain them to the shape of a real tag ("v7.0.1", "stable") and refuse
+# anything that could break out of the quotes rather than embedding it.
+_SAFE_COMMENT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._+:/-]*$")
+
+
+def _registry_key_by_action_name(actions: dict[str, str]) -> dict[str, str]:
+    """Map a bare action name (owner/repo) to its registry key."""
+    mapping: dict[str, str] = {}
+    for key, value in actions.items():
+        reference = value.split(" #", 1)[0]
+        action_name = reference.split("@", 1)[0]
+        mapping[action_name] = key
+    return mapping
+
+
+def _managed_pin_sources() -> list[Path]:
+    """Files whose action pins must track the registry.
+
+    These are the generated workflow outputs plus the hand-authored composite
+    actions. Every registry entry is, by the registry's own contract, referenced
+    by at least one of these, so a Dependabot bump of any registered action lands
+    in one of them.
+    """
+    sources = list(build_outputs().keys())
+    sources.extend(_composite_action_files())
+    return sources
+
+
+def collect_registry_updates(
+    actions: dict[str, str],
+) -> dict[str, tuple[str, str | None]]:
+    """Return registry updates implied by pins in the managed files.
+
+    Scans the generated workflows and composite actions for pinned references
+    whose action name is in the registry, and reports any that differ from the
+    registry. This is the reverse of generation: it reads a Dependabot bump back
+    out of a file Dependabot can edit so the registry can adopt it.
+
+    Returns a map of registry key to (new_uses, new_comment). Raises
+    GenerationError if two managed files disagree on the pin for the same action.
+    """
+    key_by_name = _registry_key_by_action_name(actions)
+    observed: dict[str, tuple[str, str | None, str]] = {}
+
+    for path in _managed_pin_sources():
+        if not path.exists():
+            continue
+        rel = _display_path(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise GenerationError(f"cannot read {rel}: {exc}") from exc
+        for line in text.splitlines():
+            match = _PIN_LINE_RE.search(line)
+            if not match:
+                continue
+            ref = match.group("ref")
+            key = key_by_name.get(ref.split("@", 1)[0])
+            if key is None:
+                continue
+            comment = match.group("comment")
+            comment = comment.strip() if comment else None
+            if comment is not None and not _SAFE_COMMENT_RE.match(comment):
+                raise GenerationError(
+                    f"refusing to adopt unsafe version comment for "
+                    f"'{ref.split('@', 1)[0]}' from {rel}: {comment!r}"
+                )
+            prior = observed.get(key)
+            if prior is not None and (prior[0], prior[1]) != (ref, comment):
+                raise GenerationError(
+                    f"conflicting pins for '{ref.split('@', 1)[0]}': "
+                    f"{prior[2]} has '{prior[0]}' but {rel} has '{ref}'"
+                )
+            observed[key] = (ref, comment, rel)
+
+    updates: dict[str, tuple[str, str | None]] = {}
+    for key, (ref, comment, _rel) in observed.items():
+        current = actions[key]
+        current_uses = current.split(" #", 1)[0]
+        current_comment = (
+            current.split(" #", 1)[1].strip() if " #" in current else None
+        )
+        if (ref, comment) != (current_uses, current_comment):
+            updates[key] = (ref, comment)
+    return updates
+
+
+def _rewrite_actions_toml(updates: dict[str, tuple[str, str | None]]) -> None:
+    """Rewrite the uses/comment of the named registry entries in place.
+
+    Operates line by line so the registry file keeps its layout and comments.
+    """
+    if ACTIONS_PATH.is_symlink():
+        raise GenerationError(
+            f"refusing to write through a symlinked registry path: "
+            f"{_display_path(ACTIONS_PATH)}"
+        )
+    try:
+        lines = ACTIONS_PATH.read_text(encoding="utf-8").splitlines(keepends=True)
+    except (OSError, UnicodeError) as exc:
+        raise GenerationError(f"cannot read {_display_path(ACTIONS_PATH)}: {exc}") from exc
+
+    current_key: str | None = None
+    out: list[str] = []
+    for line in lines:
+        section = _SECTION_RE.match(line)
+        if section:
+            current_key = section.group("key")
+            out.append(line)
+            continue
+        if current_key in updates:
+            uses, comment = updates[current_key]
+            stripped = line.lstrip()
+            indent = line[: len(line) - len(stripped)]
+            newline = "\n" if line.endswith("\n") else ""
+            if stripped.startswith("uses ="):
+                out.append(f'{indent}uses = "{uses}"{newline}')
+                continue
+            if stripped.startswith("comment ="):
+                if comment is None:
+                    continue
+                out.append(f'{indent}comment = "{comment}"{newline}')
+                continue
+        out.append(line)
+
+    try:
+        ACTIONS_PATH.write_text("".join(out), encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise GenerationError(
+            f"cannot write {_display_path(ACTIONS_PATH)}: {exc}"
+        ) from exc
+
+
+def sync_registry_from_tree() -> list[str]:
+    """Adopt pins bumped in managed files into the registry.
+
+    Returns the sorted registry keys that were updated.
+    """
+    if ACTIONS_PATH.is_symlink():
+        raise GenerationError(
+            f"refusing to read or write a symlinked registry path: "
+            f"{_display_path(ACTIONS_PATH)}"
+        )
+    actions = _load_actions(ACTIONS_PATH)
+    updates = collect_registry_updates(actions)
+    if updates:
+        _rewrite_actions_toml(updates)
+    return sorted(updates)
 
 
 def _indent(text: str, spaces: int) -> list[str]:
@@ -374,12 +562,24 @@ def build_outputs(actions: dict[str, str] | None = None) -> dict[Path, str]:
         raise GenerationError("manifest defines no [[workflow]] entries")
     outputs: dict[Path, str] = {}
     seen_ids: set[str] = set()
+    repo_root = REPO_ROOT.resolve()
     for workflow in workflows:
         wid = workflow.get("id", "")
         if wid in seen_ids:
             raise GenerationError(f"duplicate workflow id: {wid}")
         seen_ids.add(wid)
-        outputs[REPO_ROOT / workflow["output"]] = render_workflow(workflow, actions)
+        content = render_workflow(workflow, actions)
+        out_path = REPO_ROOT / workflow["output"]
+        # Containment: the manifest output must resolve beneath the repo, so a
+        # traversal like .github/workflows/../../../x.yml cannot make the
+        # generator (or --sync-registry, which reads these paths) touch a file
+        # outside the tree.
+        if not out_path.resolve().is_relative_to(repo_root):
+            raise GenerationError(
+                f"workflow '{workflow.get('name', wid)}' output escapes the "
+                f"repository: {workflow['output']}"
+            )
+        outputs[out_path] = content
     return outputs
 
 
@@ -388,7 +588,24 @@ def main(argv: list[str] | None = None) -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--write", action="store_true", help="write generated workflow YAML")
     group.add_argument("--check", action="store_true", help="fail if committed YAML drifts")
+    group.add_argument(
+        "--sync-registry",
+        action="store_true",
+        help="adopt action pins bumped in the generated workflows or composite "
+        "actions into actions.toml, then regenerate",
+    )
     args = parser.parse_args(argv)
+
+    if args.sync_registry:
+        try:
+            updated = sync_registry_from_tree()
+        except GenerationError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        for key in updated:
+            print(f"synced registry entry: {key}")
+        if not updated:
+            print("registry already matches the pins in the managed files")
 
     try:
         actions = _load_actions(ACTIONS_PATH)
@@ -397,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if args.write:
+    if args.write or args.sync_registry:
         try:
             synced = sync_composite_action_pins(actions)
         except GenerationError as exc:
