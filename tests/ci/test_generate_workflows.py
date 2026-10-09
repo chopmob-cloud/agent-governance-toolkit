@@ -218,7 +218,7 @@ def test_sync_registry_adopts_a_bumped_pin(tmp_path, monkeypatch):
         gen, "build_outputs", lambda *_a: {generated: generated.read_text("utf-8")}
     )
 
-    assert gen.sync_registry_from_tree() == ["checkout"]
+    assert gen.sync_registry_from_tree(verify=False) == ["checkout"]
     updated = registry.read_text(encoding="utf-8")
     assert f'uses = "actions/checkout@{new_sha}"' in updated
     assert 'comment = "v7.1.0"' in updated
@@ -324,7 +324,7 @@ def test_sync_registry_preserves_registry_layout_and_comments(tmp_path, monkeypa
         gen, "build_outputs", lambda *_a: {generated: generated.read_text("utf-8")}
     )
 
-    assert gen.sync_registry_from_tree() == ["checkout"]
+    assert gen.sync_registry_from_tree(verify=False) == ["checkout"]
     text = registry.read_text(encoding="utf-8")
     assert text.startswith("# header comment\n\n")
     assert f'actions/setup-node@{"e" * 40}' in text
@@ -418,6 +418,62 @@ def test_build_outputs_rejects_output_path_traversal(monkeypatch):
     monkeypatch.setattr(gen, "_load_toml", lambda _p: evil)
     with pytest.raises(gen.GenerationError, match="escapes the repository"):
         gen.build_outputs(actions)
+
+
+def test_pin_line_regex_ignores_commented_uses():
+    # A commented-out step is not a pin source (anchored regex).
+    assert gen._PIN_LINE_RE.match("      # - uses: actions/checkout@" + "a" * 40 + " # v9.9.9") is None
+    assert gen._PIN_LINE_RE.match("      - uses: actions/checkout@" + "a" * 40 + " # v7.0.1") is not None
+    assert gen._PIN_LINE_RE.match("        uses: actions/setup-python@" + "b" * 40 + " # v7.0.0") is not None
+
+
+def test_sync_ignores_commented_pin_but_adopts_real_one(tmp_path, monkeypatch):
+    registry = tmp_path / "actions.toml"
+    registry.write_text(
+        f'[checkout]\nuses = "actions/checkout@{"b" * 40}"\ncomment = "v7.0.1"\n',
+        encoding="utf-8",
+    )
+    generated = tmp_path / "policy-engine-ci.yml"
+    # A commented-out bogus bump plus the real pin that matches the registry.
+    generated.write_text(
+        f"      # - uses: actions/checkout@{'f' * 40} # v9.9.9\n"
+        f"      - uses: actions/checkout@{'b' * 40} # v7.0.1\n",
+        encoding="utf-8",
+    )
+    composite = tmp_path / "composite"
+    composite.mkdir()
+    monkeypatch.setattr(gen, "ACTIONS_PATH", registry)
+    monkeypatch.setattr(gen, "COMPOSITE_ACTIONS_DIR", composite)
+    monkeypatch.setattr(gen, "build_outputs", lambda *_a: {generated: generated.read_text("utf-8")})
+    # The commented bogus line is ignored, so no update and no conflict.
+    assert gen.sync_registry_from_tree(verify=False) == []
+
+
+def test_verify_pin_versions_accepts_matching_sha(monkeypatch):
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", lambda name, ver, *, token: "a" * 40)
+    gen.verify_pin_versions({"checkout": ("actions/checkout@" + "a" * 40, "v7.1.0")}, token=None)
+
+
+def test_verify_pin_versions_rejects_mismatch(monkeypatch):
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", lambda name, ver, *, token: "c" * 40)
+    with pytest.raises(gen.GenerationError, match="pin mismatch"):
+        gen.verify_pin_versions({"checkout": ("actions/checkout@" + "a" * 40, "v7.1.0")}, token=None)
+
+
+def test_verify_pin_versions_fails_closed_when_unresolvable(monkeypatch):
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", lambda name, ver, *, token: None)
+    with pytest.raises(gen.GenerationError, match="cannot verify"):
+        gen.verify_pin_versions({"checkout": ("actions/checkout@" + "a" * 40, "v9.9.9")}, token=None)
+
+
+def test_verify_pin_versions_skips_non_version_comment(monkeypatch):
+    def _boom(*_a, **_k):
+        raise AssertionError("resolver must not be called for a non-version comment")
+
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", _boom)
+    gen.verify_pin_versions(
+        {"rust-toolchain": ("dtolnay/rust-toolchain@" + "a" * 40, "stable")}, token=None
+    )
 
 
 def test_unknown_action_key_is_rejected():

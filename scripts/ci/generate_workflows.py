@@ -39,9 +39,12 @@ against the same action registry, and ``--write`` synchronizes their pins.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import sys
 import tomllib
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -252,10 +255,18 @@ def sync_composite_action_pins(actions: dict[str, str]) -> list[Path]:
     return changed
 
 
+# Anchored to a real step line: optional indent, an optional "- " list dash, then
+# "uses:". A commented-out line ("# - uses: ...@sha # v9.0.0") starts with "#"
+# after the indent and therefore never matches, so it is not treated as a pin
+# source. Use with .match (start-anchored).
 _PIN_LINE_RE = re.compile(
-    r"uses:\s*(?P<ref>[A-Za-z0-9._/-]+@[0-9a-f]{40})(?:\s*#\s*(?P<comment>.+?))?\s*$"
+    r"\s*(?:-\s+)?uses:\s*(?P<ref>[A-Za-z0-9._/-]+@[0-9a-f]{40})(?:\s*#\s*(?P<comment>.+?))?\s*$"
 )
 _SECTION_RE = re.compile(r"^\[(?P<key>[^\]]+)\]\s*$")
+# A trailing comment that looks like a resolvable version tag (e.g. "v7.0.1").
+# Non-version comments such as "stable" are not resolvable to a single commit and
+# are left unverified.
+_VERSION_COMMENT_RE = re.compile(r"^v\d+(?:\.\d+)*$")
 # Version comments adopted into the registry are written as a TOML string, so
 # constrain them to the shape of a real tag ("v7.0.1", "stable") and refuse
 # anything that could break out of the quotes rather than embedding it.
@@ -310,7 +321,7 @@ def collect_registry_updates(
         except (OSError, UnicodeError) as exc:
             raise GenerationError(f"cannot read {rel}: {exc}") from exc
         for line in text.splitlines():
-            match = _PIN_LINE_RE.search(line)
+            match = _PIN_LINE_RE.match(line)
             if not match:
                 continue
             ref = match.group("ref")
@@ -390,10 +401,64 @@ def _rewrite_actions_toml(updates: dict[str, tuple[str, str | None]]) -> None:
         ) from exc
 
 
-def sync_registry_from_tree() -> list[str]:
+def _resolve_tag_commit_sha(action_name: str, version: str, *, token: str | None) -> str | None:
+    """Resolve ``owner/repo@version`` to the 40-hex commit SHA that tag points to,
+    via the GitHub API. Returns the lowercased SHA, or None if it cannot be
+    resolved (network/auth error, missing tag, malformed response).
+    """
+    url = f"https://api.github.com/repos/{action_name}/commits/{version}"
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "agt-generate-workflows",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:  # fixed https GitHub host
+            payload = json.load(resp)
+    except Exception:
+        return None
+    sha = str(payload.get("sha", "")).lower()
+    return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else None
+
+
+def verify_pin_versions(
+    updates: dict[str, tuple[str, str | None]], *, token: str | None
+) -> None:
+    """Confirm each adopted pin's SHA is the commit its version comment resolves to.
+
+    Fails closed: a version-tagged pin whose SHA does not match, or cannot be
+    resolved, is refused, so a bumped SHA that does not correspond to its ``# vX``
+    comment is never written into the registry. Non-version comments (for example
+    "stable") are not resolvable to a single commit and are left unverified.
+    """
+    for _key, (uses, comment) in sorted(updates.items()):
+        if not comment or not _VERSION_COMMENT_RE.match(comment):
+            continue
+        action_name, _sep, sha = uses.partition("@")
+        sha = sha.lower()
+        resolved = _resolve_tag_commit_sha(action_name, comment, token=token)
+        if resolved is None:
+            raise GenerationError(
+                f"cannot verify {action_name}@{comment} resolves to a commit "
+                f"(network/token/tag); refusing to adopt {sha}"
+            )
+        if resolved != sha:
+            raise GenerationError(
+                f"pin mismatch for {action_name}: {comment} resolves to "
+                f"{resolved}, not {sha}"
+            )
+
+
+def sync_registry_from_tree(*, verify: bool = True) -> list[str]:
     """Adopt pins bumped in managed files into the registry.
 
-    Returns the sorted registry keys that were updated.
+    When ``verify`` is true (the default), each adopted version-tagged pin is
+    checked against the GitHub API so a SHA that does not resolve to its ``# vX``
+    comment is refused rather than written in. Returns the sorted registry keys
+    that were updated.
     """
     if ACTIONS_PATH.is_symlink():
         raise GenerationError(
@@ -402,6 +467,9 @@ def sync_registry_from_tree() -> list[str]:
         )
     actions = _load_actions(ACTIONS_PATH)
     updates = collect_registry_updates(actions)
+    if updates and verify:
+        token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        verify_pin_versions(updates, token=token)
     if updates:
         _rewrite_actions_toml(updates)
     return sorted(updates)
@@ -594,11 +662,17 @@ def main(argv: list[str] | None = None) -> int:
         help="adopt action pins bumped in the generated workflows or composite "
         "actions into actions.toml, then regenerate",
     )
+    parser.add_argument(
+        "--no-verify-pins",
+        action="store_true",
+        help="with --sync-registry, skip the GitHub API check that each adopted "
+        "SHA resolves to its version comment (offline/emergency use only)",
+    )
     args = parser.parse_args(argv)
 
     if args.sync_registry:
         try:
-            updated = sync_registry_from_tree()
+            updated = sync_registry_from_tree(verify=not args.no_verify_pins)
         except GenerationError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
