@@ -263,10 +263,6 @@ _PIN_LINE_RE = re.compile(
     r"\s*(?:-\s+)?uses:\s*(?P<ref>[A-Za-z0-9._/-]+@[0-9a-f]{40})(?:\s*#\s*(?P<comment>.+?))?\s*$"
 )
 _SECTION_RE = re.compile(r"^\[(?P<key>[^\]]+)\]\s*$")
-# A trailing comment that looks like a resolvable version tag (e.g. "v7.0.1").
-# Non-version comments such as "stable" are not resolvable to a single commit and
-# are left unverified.
-_VERSION_COMMENT_RE = re.compile(r"^v\d+(?:\.\d+)*$")
 # Version comments adopted into the registry are written as a TOML string, so
 # constrain them to the shape of a real tag ("v7.0.1", "stable") and refuse
 # anything that could break out of the quotes rather than embedding it.
@@ -427,23 +423,31 @@ def _resolve_tag_commit_sha(action_name: str, version: str, *, token: str | None
 def verify_pin_versions(
     updates: dict[str, tuple[str, str | None]], *, token: str | None
 ) -> None:
-    """Confirm each adopted pin's SHA is the commit its version comment resolves to.
+    """Confirm each adopted pin's SHA is the commit its comment resolves to.
 
-    Fails closed: a version-tagged pin whose SHA does not match, or cannot be
-    resolved, is refused, so a bumped SHA that does not correspond to its ``# vX``
-    comment is never written into the registry. Non-version comments (for example
-    "stable") are not resolvable to a single commit and are left unverified.
+    Fails closed: every adopted pin must carry a comment that resolves, via the
+    GitHub API, to the exact SHA being adopted. ``_resolve_tag_commit_sha`` hits
+    ``GET /repos/{action}/commits/{ref}``, which accepts a tag name (``v7.0.1``)
+    or a branch name (``stable``) interchangeably, so non-version ref comments
+    are verified the same way version tags are -- nothing is adopted unverified.
+    A pin with no comment at all cannot be checked against anything, so it is
+    refused outright rather than silently skipped; use ``--no-verify-pins`` for
+    an explicit, logged offline opt-out instead.
     """
     for _key, (uses, comment) in sorted(updates.items()):
-        if not comment or not _VERSION_COMMENT_RE.match(comment):
-            continue
         action_name, _sep, sha = uses.partition("@")
         sha = sha.lower()
+        if not comment:
+            raise GenerationError(
+                f"refusing to adopt {action_name}@{sha} with no comment to "
+                f"verify it against; use --no-verify-pins to adopt without "
+                f"verification"
+            )
         resolved = _resolve_tag_commit_sha(action_name, comment, token=token)
         if resolved is None:
             raise GenerationError(
                 f"cannot verify {action_name}@{comment} resolves to a commit "
-                f"(network/token/tag); refusing to adopt {sha}"
+                f"(network/token/ref); refusing to adopt {sha}"
             )
         if resolved != sha:
             raise GenerationError(
@@ -676,8 +680,9 @@ def main(argv: list[str] | None = None) -> int:
         except GenerationError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
+        marker = " [UNVERIFIED: --no-verify-pins, not checked against GitHub]" if args.no_verify_pins else ""
         for key in updated:
-            print(f"synced registry entry: {key}")
+            print(f"synced registry entry: {key}{marker}")
         if not updated:
             print("registry already matches the pins in the managed files")
 

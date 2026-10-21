@@ -466,14 +466,59 @@ def test_verify_pin_versions_fails_closed_when_unresolvable(monkeypatch):
         gen.verify_pin_versions({"checkout": ("actions/checkout@" + "a" * 40, "v9.9.9")}, token=None)
 
 
-def test_verify_pin_versions_skips_non_version_comment(monkeypatch):
-    def _boom(*_a, **_k):
-        raise AssertionError("resolver must not be called for a non-version comment")
+def test_verify_pin_versions_resolves_non_version_comment(monkeypatch):
+    # A branch-name comment ("stable") is verified the same way a version tag
+    # is: _resolve_tag_commit_sha IS called, not skipped.
+    calls = []
 
-    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", _boom)
+    def _record(name, ref, *, token):
+        calls.append((name, ref))
+        return "a" * 40
+
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", _record)
     gen.verify_pin_versions(
         {"rust-toolchain": ("dtolnay/rust-toolchain@" + "a" * 40, "stable")}, token=None
     )
+    assert calls == [("dtolnay/rust-toolchain", "stable")]
+
+
+def test_verify_pin_versions_rejects_non_version_comment_mismatch(monkeypatch):
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", lambda name, ref, *, token: "c" * 40)
+    with pytest.raises(gen.GenerationError, match="pin mismatch"):
+        gen.verify_pin_versions(
+            {"rust-toolchain": ("dtolnay/rust-toolchain@" + "a" * 40, "stable")}, token=None
+        )
+
+
+def test_verify_pin_versions_refuses_missing_comment(monkeypatch):
+    def _boom(*_a, **_k):
+        raise AssertionError("resolver must not be called when there is no comment")
+
+    monkeypatch.setattr(gen, "_resolve_tag_commit_sha", _boom)
+    with pytest.raises(gen.GenerationError, match="no comment to verify"):
+        gen.verify_pin_versions(
+            {"checkout": ("actions/checkout@" + "a" * 40, None)}, token=None
+        )
+
+
+def test_sync_registry_no_verify_pins_prints_unverified_marker(monkeypatch, capsys):
+    monkeypatch.setattr(gen, "sync_registry_from_tree", lambda *, verify: ["checkout"])
+    monkeypatch.setattr(gen, "build_outputs", lambda *_a: {})
+    monkeypatch.setattr(gen, "sync_composite_action_pins", lambda *_a: [])
+
+    assert gen.main(["--sync-registry", "--no-verify-pins"]) == 0
+    captured = capsys.readouterr()
+    assert "synced registry entry: checkout [UNVERIFIED" in captured.out
+
+
+def test_sync_registry_with_verification_has_no_unverified_marker(monkeypatch, capsys):
+    monkeypatch.setattr(gen, "sync_registry_from_tree", lambda *, verify: ["checkout"])
+    monkeypatch.setattr(gen, "build_outputs", lambda *_a: {})
+    monkeypatch.setattr(gen, "sync_composite_action_pins", lambda *_a: [])
+
+    assert gen.main(["--sync-registry"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.strip() == "synced registry entry: checkout"
 
 
 def test_unknown_action_key_is_rejected():
